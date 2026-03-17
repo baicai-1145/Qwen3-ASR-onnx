@@ -233,6 +233,23 @@ class AudioStackCore(nn.Module):
         return x
 
 
+class EncoderCore(nn.Module):
+    def __init__(self, audio_tower: nn.Module):
+        super().__init__()
+        self.conv_embed_core = ConvEmbedCore(audio_tower)
+        self.audio_stack_core = AudioStackCore(audio_tower)
+
+    def forward(self, padded_feature: torch.Tensor, chunk_lengths: torch.Tensor):
+        padded_embed = self.conv_embed_core(padded_feature)
+        chunk_feature_lengths_after = feature_output_lengths(chunk_lengths)
+        mask_after = (
+            torch.arange(padded_embed.shape[1], device=padded_embed.device).unsqueeze(0)
+            < chunk_feature_lengths_after.unsqueeze(1)
+        )
+        hidden_states = padded_embed[mask_after]
+        return self.audio_stack_core(hidden_states)
+
+
 class DecoderCore(nn.Module):
     def __init__(self, thinker: nn.Module, audio_token_id: int, num_layers: int, max_cache_len: int):
         super().__init__()
@@ -309,15 +326,27 @@ def append_worklog(worklog_path: Path, model_name: str, output_dir: Path, dtype_
         "",
         f"### 节点 6：ONNX 导出完成（{model_name}）",
         f"- 完成时间：`{time.strftime('%Y-%m-%d %H:%M:%S')}`",
-        "- 导出范围：单音频全链路纯 ONNX 运行时所需的 3 张图：`conv_embed`、`audio_stack`、`decoder`。",
+        "- 导出范围：单音频全链路纯 ONNX 运行时所需的 2 张图：`encoder`、`decoder`。",
         "- 运行时依赖目标：`onnxruntime + transformers(tokenizer/feature_extractor) + numpy + soundfile/librosa`，不依赖 PyTorch。",
-        "- 说明：为绕过上游音频编码链路的导出器问题，音频 encoder stack 使用同权重的 ONNX 友好实现。",
+        "- 说明：音频编码链路已合并为单一 `encoder.onnx`，内部仍使用同权重的 ONNX 友好实现。",
         f"- 导出 dtype：`{dtype_name}`",
         f"- 导出目录：`{output_dir}`",
         "- decoder 图说明：prefill/decode 复用同一张 decoder 图与同一套权重，保留固定 shape 静态 KV cache。",
     ]
     with worklog_path.open("a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
+
+
+def cleanup_legacy_exports(output_dir: Path) -> None:
+    for name in (
+        "conv_embed.onnx",
+        "conv_embed.onnx.data",
+        "audio_stack.onnx",
+        "audio_stack.onnx.data",
+    ):
+        path = output_dir / name
+        if path.exists():
+            path.unlink()
 
 
 def main() -> None:
@@ -327,8 +356,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     paths = [
-        output_dir / "conv_embed.onnx",
-        output_dir / "audio_stack.onnx",
+        output_dir / "encoder.onnx",
         output_dir / "decoder.onnx",
         output_dir / "metadata.json",
     ]
@@ -370,40 +398,20 @@ def main() -> None:
     )
     chunk_lengths = torch.full((chunk_num,), window, device=input_features.device, dtype=torch.long)
     chunk_lengths[-1] = feature_len - window * (chunk_num - 1)
-    chunk_feature_lengths_after = feature_output_lengths(chunk_lengths)
 
-    conv_embed_core = ConvEmbedCore(audio_tower).eval()
+    encoder_core = EncoderCore(audio_tower).eval()
     with torch.no_grad():
-        padded_embed = conv_embed_core(padded_feature)
-        mask_after = (
-            torch.arange(padded_embed.shape[1], device=padded_embed.device).unsqueeze(0)
-            < chunk_feature_lengths_after.unsqueeze(1)
-        )
-        hidden_states = padded_embed[mask_after]
-        audio_stack_core = AudioStackCore(audio_tower).eval()
-        audio_features = audio_stack_core(hidden_states)
+        audio_features = encoder_core(padded_feature, chunk_lengths)
 
     export_graph(
-        conv_embed_core,
-        args_tuple=(padded_feature,),
-        output_path=output_dir / "conv_embed.onnx",
-        input_names=["padded_feature"],
-        output_names=["padded_embed"],
-        dynamic_axes={
-            "padded_feature": {0: "num_chunks", 3: "chunk_frames"},
-            "padded_embed": {0: "num_chunks", 1: "chunk_frames_after_cnn"},
-        },
-        opset=args.opset,
-    )
-
-    export_graph(
-        audio_stack_core,
-        args_tuple=(hidden_states,),
-        output_path=output_dir / "audio_stack.onnx",
-        input_names=["hidden_states"],
+        encoder_core,
+        args_tuple=(padded_feature, chunk_lengths),
+        output_path=output_dir / "encoder.onnx",
+        input_names=["padded_feature", "chunk_lengths"],
         output_names=["audio_features"],
         dynamic_axes={
-            "hidden_states": {0: "audio_seq"},
+            "padded_feature": {0: "num_chunks", 3: "chunk_frames"},
+            "chunk_lengths": {0: "num_chunks"},
             "audio_features": {0: "audio_seq"},
         },
         opset=args.opset,
@@ -464,8 +472,7 @@ def main() -> None:
         "text_hidden_size": int(text_config.hidden_size),
         "num_layers": num_layers,
         "static_cache_len": int(args.static_cache_len),
-        "conv_embed_model": "conv_embed.onnx",
-        "audio_stack_model": "audio_stack.onnx",
+        "encoder_model": "encoder.onnx",
         "decoder_model": "decoder.onnx",
         "prefill_model": "decoder.onnx",
         "decode_model": "decoder.onnx",
@@ -474,6 +481,7 @@ def main() -> None:
     }
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, ensure_ascii=False, indent=2)
+    cleanup_legacy_exports(output_dir)
 
     if args.worklog:
         append_worklog(Path(args.worklog).resolve(), model_name=model_path.name, output_dir=output_dir, dtype_name=args.dtype)
