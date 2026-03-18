@@ -43,57 +43,80 @@ except Exception:
 
 
 if cp is not None:
+    _SCATTER_UPDATE_HALF_KERNEL = cp.RawKernel(
+        r"""
+        #include <cuda_fp16.h>
+        extern "C" __global__ void scatter_update_half(
+            half* cache,
+            const half* update,
+            const long long* positions,
+            int active,
+            int heads,
+            int cache_len,
+            int head_dim) {
+          long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+          long long total = (long long)active * heads * head_dim;
+          if (idx >= total) return;
+          int dim = idx % head_dim;
+          long long tmp = idx / head_dim;
+          int head = tmp % heads;
+          int row = tmp / heads;
+          long long pos = positions[row];
+          long long cache_index = (((long long)row * heads + head) * cache_len + pos) * head_dim + dim;
+          long long update_index = (((long long)row * heads + head) * 1 + 0) * head_dim + dim;
+          cache[cache_index] = update[update_index];
+        }
+        """,
+        "scatter_update_half",
+        options=("--std=c++14",),
+    )
+    _SCATTER_UPDATE_FLOAT_KERNEL = cp.RawKernel(
+        r"""
+        extern "C" __global__ void scatter_update_float(
+            float* cache,
+            const float* update,
+            const long long* positions,
+            int active,
+            int heads,
+            int cache_len,
+            int head_dim) {
+          long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+          long long total = (long long)active * heads * head_dim;
+          if (idx >= total) return;
+          int dim = idx % head_dim;
+          long long tmp = idx / head_dim;
+          int head = tmp % heads;
+          int row = tmp / heads;
+          long long pos = positions[row];
+          long long cache_index = (((long long)row * heads + head) * cache_len + pos) * head_dim + dim;
+          long long update_index = (((long long)row * heads + head) * 1 + 0) * head_dim + dim;
+          cache[cache_index] = update[update_index];
+        }
+        """,
+        "scatter_update_float",
+        options=("--std=c++14",),
+    )
+else:
+    _SCATTER_UPDATE_HALF_KERNEL = None
+    _SCATTER_UPDATE_FLOAT_KERNEL = None
+
+_SCATTER_UPDATE_KERNEL_MIN_ACTIVE = 8
+_SCATTER_UPDATE_KERNEL_THREADS = 256
+
+
+if cp is not None:
     Path(os.environ["CUPY_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-
-
-_CACHE_UPDATE_KERNELS: Dict[str, Any] = {}
 
 
 def get_cache_update_kernel(dtype: Any):
     if cp is None:
         return None
     dtype_name = np.dtype(dtype).name
-    if dtype_name in _CACHE_UPDATE_KERNELS:
-        return _CACHE_UPDATE_KERNELS[dtype_name]
     if dtype_name == "float16":
-        scalar_type = "half"
-        prologue = "#include <cuda_fp16.h>\n"
-    elif dtype_name == "float32":
-        scalar_type = "float"
-        prologue = ""
-    else:
-        return None
-    kernel = cp.RawKernel(
-        prologue
-        + f"""
-extern "C" __global__ void scatter_update(
-    {scalar_type}* cache,
-    const {scalar_type}* update,
-    const long long* positions,
-    int active,
-    int heads,
-    int cache_len,
-    int head_dim
-) {{
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = (long long)active * heads * head_dim;
-    if (idx >= total) {{
-        return;
-    }}
-    int dim = idx % head_dim;
-    long long tmp = idx / head_dim;
-    int head = tmp % heads;
-    int row = tmp / heads;
-    long long pos = positions[row];
-    long long cache_index = (((long long)row * heads + head) * cache_len + pos) * head_dim + dim;
-    long long update_index = (((long long)row * heads + head) * 1 + 0) * head_dim + dim;
-    cache[cache_index] = update[update_index];
-}}
-""",
-        "scatter_update",
-    )
-    _CACHE_UPDATE_KERNELS[dtype_name] = kernel
-    return kernel
+        return _SCATTER_UPDATE_HALF_KERNEL
+    if dtype_name == "float32":
+        return _SCATTER_UPDATE_FLOAT_KERNEL
+    return None
 
 
 def is_url(text: str) -> bool:
@@ -278,18 +301,19 @@ def apply_cache_updates(cache_arrays: Sequence[Any], update_arrays: Sequence[Any
     if active_count <= 0:
         return
     position_index = cp.asarray(np.asarray(positions[:active_count], dtype=np.int64))
+    row_index = None
     for cache_array, update_array in zip(cache_arrays, update_arrays):
         kernel = get_cache_update_kernel(cache_array.dtype)
-        if kernel is None:
-            row_index = cp.arange(active_count, dtype=cp.int64)
+        if kernel is None or active_count < _SCATTER_UPDATE_KERNEL_MIN_ACTIVE:
+            if row_index is None:
+                row_index = cp.arange(active_count, dtype=cp.int64)
             cache_array[row_index, :, position_index, :] = update_array[:active_count, :, 0, :]
             continue
         total = active_count * int(cache_array.shape[1]) * int(cache_array.shape[3])
-        threads = 256
-        blocks = (total + threads - 1) // threads
+        blocks = (total + _SCATTER_UPDATE_KERNEL_THREADS - 1) // _SCATTER_UPDATE_KERNEL_THREADS
         kernel(
             (blocks,),
-            (threads,),
+            (_SCATTER_UPDATE_KERNEL_THREADS,),
             (
                 cache_array,
                 update_array,
@@ -300,6 +324,26 @@ def apply_cache_updates(cache_arrays: Sequence[Any], update_arrays: Sequence[Any
                 int(cache_array.shape[3]),
             ),
         )
+
+
+def argmax_token_ids(logits_output: ort.OrtValue, logits_gpu: Any | None, active_count: int = 1) -> np.ndarray:
+    if logits_gpu is not None:
+        return cp.asnumpy(cp.argmax(logits_gpu[:active_count], axis=1)).astype(np.int64, copy=False)
+    logits = logits_output.numpy()
+    return np.argmax(logits[:active_count], axis=1).astype(np.int64, copy=False)
+
+
+def apply_cache_updates_cpu(
+    cache_values: Sequence[ort.OrtValue], update_outputs: Sequence[ort.OrtValue], positions: np.ndarray, active_count: int
+) -> None:
+    if active_count <= 0:
+        return
+    position_index = np.asarray(positions[:active_count], dtype=np.int64)
+    for cache_value, update_output in zip(cache_values, update_outputs):
+        cache_array = cache_value.numpy()
+        update_array = update_output.numpy()
+        for row_index, pos in enumerate(position_index):
+            cache_array[row_index, :, pos : pos + 1, :] = update_array[row_index : row_index + 1, :, :1, :]
 
 
 class QueueFullError(RuntimeError):
@@ -319,6 +363,7 @@ class DecoderThreadState:
     update_outputs: List[ort.OrtValue]
     token_input: np.ndarray
     cache_position: np.ndarray
+    logits_gpu: Any | None = None
     cache_gpu: List[Any] = field(default_factory=list)
     update_gpu: List[Any] = field(default_factory=list)
     prefill_cache_inputs: List[ort.OrtValue] = field(default_factory=list)
@@ -390,6 +435,11 @@ class OnnxAsrRuntime:
                 self._prefill_cache_specs.append((shape, ort_dtype_from_str(item.type)))
         self._decode_logits_shape = ort_shape_to_static_list(self.decode_output_items[0].shape)
         self._decode_logits_dtype = ort_dtype_from_str(self.decode_output_items[0].type)
+        self._cuda_decode_enabled = (
+            cp is not None
+            and "CUDAExecutionProvider" in self.prefill_session.get_providers()
+            and "CUDAExecutionProvider" in self.decode_session.get_providers()
+        )
         decode_cache_mode = self.metadata.get("decode_cache_mode", "full")
         self._decode_cache_specs = []
         for index, item in enumerate(self.decode_output_items[1:]):
@@ -425,31 +475,42 @@ class OnnxAsrRuntime:
     def get_decoder_thread_state(self) -> DecoderThreadState:
         state = getattr(self._thread_local, "decoder_state", None)
         if state is None:
+            device_type = "cuda" if self._cuda_decode_enabled else "cpu"
             cache_values = [
-                ort.OrtValue.ortvalue_from_shape_and_type(shape, dtype, device_type="cuda", device_id=0)
+                ort.OrtValue.ortvalue_from_shape_and_type(shape, dtype, device_type=device_type, device_id=0)
                 for shape, dtype in self._prefill_cache_specs
             ]
             update_outputs = [
-                ort.OrtValue.ortvalue_from_shape_and_type(shape, dtype, device_type="cuda", device_id=0)
+                ort.OrtValue.ortvalue_from_shape_and_type(shape, dtype, device_type=device_type, device_id=0)
                 for shape, dtype in self._decode_cache_specs
             ]
+            logits_output = ort.OrtValue.ortvalue_from_shape_and_type(
+                self._decode_logits_shape,
+                self._decode_logits_dtype,
+                device_type=device_type,
+                device_id=0,
+            )
             state = DecoderThreadState(
                 prefill_binding=self.prefill_session.io_binding(),
                 decode_binding=self.decode_session.io_binding(),
-                logits_output=ort.OrtValue.ortvalue_from_shape_and_type(
-                    self._decode_logits_shape,
-                    self._decode_logits_dtype,
-                    device_type="cpu",
-                    device_id=0,
-                ),
+                logits_output=logits_output,
                 cache_values=cache_values,
                 update_outputs=update_outputs,
                 token_input=np.zeros((1, 1), dtype=np.int64),
                 cache_position=np.zeros((1, 1), dtype=np.int64),
-                cache_gpu=[ortvalue_to_cupy(value, dtype) for value, (_, dtype) in zip(cache_values, self._prefill_cache_specs)],
-                update_gpu=[ortvalue_to_cupy(value, dtype) for value, (_, dtype) in zip(update_outputs, self._decode_cache_specs)],
+                logits_gpu=ortvalue_to_cupy(logits_output, self._decode_logits_dtype) if self._cuda_decode_enabled else None,
+                cache_gpu=(
+                    [ortvalue_to_cupy(value, dtype) for value, (_, dtype) in zip(cache_values, self._prefill_cache_specs)]
+                    if self._cuda_decode_enabled
+                    else []
+                ),
+                update_gpu=(
+                    [ortvalue_to_cupy(value, dtype) for value, (_, dtype) in zip(update_outputs, self._decode_cache_specs)]
+                    if self._cuda_decode_enabled
+                    else []
+                ),
                 prefill_cache_inputs=[
-                    ort.OrtValue.ortvalue_from_numpy(np.zeros(shape, dtype=dtype), "cuda", 0)
+                    ort.OrtValue.ortvalue_from_numpy(np.zeros(shape, dtype=dtype), device_type, 0)
                     for shape, dtype in self._prefill_cache_specs
                 ],
             )
@@ -558,8 +619,10 @@ class OnnxAsrRuntime:
         for item, value in zip(self.prefill_output_items[1:], state.cache_values):
             prefill_binding.bind_ortvalue_output(item.name, value)
         self.prefill_session.run_with_iobinding(prefill_binding)
-        logits = state.logits_output.numpy()
-        return int(np.argmax(logits[0])), state.cache_values
+        if state.logits_gpu is not None:
+            prefill_binding.synchronize_outputs()
+        next_token_ids = argmax_token_ids(state.logits_output, state.logits_gpu, active_count=1)
+        return int(next_token_ids[0]), state.cache_values
 
     def decode_tokens(self, input_ids: np.ndarray, audio_features: np.ndarray) -> Tuple[List[int], float]:
         inference_start = time.perf_counter()
@@ -590,9 +653,12 @@ class OnnxAsrRuntime:
             for item, value in zip(self.decode_output_items[1:], state.update_outputs):
                 decode_binding.bind_ortvalue_output(item.name, value)
             self.decode_session.run_with_iobinding(decode_binding)
-            apply_cache_updates(state.cache_gpu, state.update_gpu, state.cache_position[:, 0], active_count=1)
-            logits = state.logits_output.numpy()
-            next_token_id = int(np.argmax(logits[0]))
+            if state.logits_gpu is not None:
+                decode_binding.synchronize_outputs()
+                apply_cache_updates(state.cache_gpu, state.update_gpu, state.cache_position[:, 0], active_count=1)
+            else:
+                apply_cache_updates_cpu(state.cache_values, state.update_outputs, state.cache_position[:, 0], active_count=1)
+            next_token_id = int(argmax_token_ids(state.logits_output, state.logits_gpu, active_count=1)[0])
             state.cache_position[0, 0] += 1
 
         inference_seconds = time.perf_counter() - inference_start
