@@ -6,6 +6,7 @@ import io
 import itertools
 import json
 import math
+import os
 import queue
 import threading
 import time
@@ -22,6 +23,9 @@ import onnxruntime as ort
 import soundfile as sf
 from transformers import AutoTokenizer, WhisperFeatureExtractor
 
+os.environ.setdefault("TMPDIR", "/dev/shm")
+os.environ.setdefault("CUPY_CACHE_DIR", "/dev/shm/cupy-kernel-cache")
+
 try:
     import cupy as cp
 except Exception:
@@ -36,6 +40,60 @@ try:
     from scipy.signal import resample_poly
 except Exception:
     resample_poly = None
+
+
+if cp is not None:
+    Path(os.environ["CUPY_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+
+
+_CACHE_UPDATE_KERNELS: Dict[str, Any] = {}
+
+
+def get_cache_update_kernel(dtype: Any):
+    if cp is None:
+        return None
+    dtype_name = np.dtype(dtype).name
+    if dtype_name in _CACHE_UPDATE_KERNELS:
+        return _CACHE_UPDATE_KERNELS[dtype_name]
+    if dtype_name == "float16":
+        scalar_type = "half"
+        prologue = "#include <cuda_fp16.h>\n"
+    elif dtype_name == "float32":
+        scalar_type = "float"
+        prologue = ""
+    else:
+        return None
+    kernel = cp.RawKernel(
+        prologue
+        + f"""
+extern "C" __global__ void scatter_update(
+    {scalar_type}* cache,
+    const {scalar_type}* update,
+    const long long* positions,
+    int active,
+    int heads,
+    int cache_len,
+    int head_dim
+) {{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)active * heads * head_dim;
+    if (idx >= total) {{
+        return;
+    }}
+    int dim = idx % head_dim;
+    long long tmp = idx / head_dim;
+    int head = tmp % heads;
+    int row = tmp / heads;
+    long long pos = positions[row];
+    long long cache_index = (((long long)row * heads + head) * cache_len + pos) * head_dim + dim;
+    long long update_index = (((long long)row * heads + head) * 1 + 0) * head_dim + dim;
+    cache[cache_index] = update[update_index];
+}}
+""",
+        "scatter_update",
+    )
+    _CACHE_UPDATE_KERNELS[dtype_name] = kernel
+    return kernel
 
 
 def is_url(text: str) -> bool:
@@ -219,11 +277,29 @@ def apply_cache_updates(cache_arrays: Sequence[Any], update_arrays: Sequence[Any
         raise RuntimeError("CuPy is required for device-side cache updates.")
     if active_count <= 0:
         return
-    row_index = cp.arange(active_count, dtype=cp.int64)
     position_index = cp.asarray(np.asarray(positions[:active_count], dtype=np.int64))
     for cache_array, update_array in zip(cache_arrays, update_arrays):
-        cache_array[row_index, :, position_index, :] = update_array[:active_count, :, 0, :]
-    cp.cuda.get_current_stream().synchronize()
+        kernel = get_cache_update_kernel(cache_array.dtype)
+        if kernel is None:
+            row_index = cp.arange(active_count, dtype=cp.int64)
+            cache_array[row_index, :, position_index, :] = update_array[:active_count, :, 0, :]
+            continue
+        total = active_count * int(cache_array.shape[1]) * int(cache_array.shape[3])
+        threads = 256
+        blocks = (total + threads - 1) // threads
+        kernel(
+            (blocks,),
+            (threads,),
+            (
+                cache_array,
+                update_array,
+                position_index,
+                active_count,
+                int(cache_array.shape[1]),
+                int(cache_array.shape[2]),
+                int(cache_array.shape[3]),
+            ),
+        )
 
 
 class QueueFullError(RuntimeError):
@@ -314,16 +390,15 @@ class OnnxAsrRuntime:
                 self._prefill_cache_specs.append((shape, ort_dtype_from_str(item.type)))
         self._decode_logits_shape = ort_shape_to_static_list(self.decode_output_items[0].shape)
         self._decode_logits_dtype = ort_dtype_from_str(self.decode_output_items[0].type)
-        self._decode_cache_specs = [
-            (
-                resolve_shape_with_reference(
-                    item.shape,
-                    self._prefill_cache_specs[index][0] if index < len(self._prefill_cache_specs) else None,
-                ),
-                ort_dtype_from_str(item.type),
-            )
-            for index, item in enumerate(self.decode_output_items[1:])
-        ]
+        decode_cache_mode = self.metadata.get("decode_cache_mode", "full")
+        self._decode_cache_specs = []
+        for index, item in enumerate(self.decode_output_items[1:]):
+            reference_shape = self._prefill_cache_specs[index][0] if index < len(self._prefill_cache_specs) else None
+            if decode_cache_mode == "delta" and reference_shape is not None and len(reference_shape) == 4:
+                shape = [int(reference_shape[0]), int(reference_shape[1]), 1, int(reference_shape[3])]
+            else:
+                shape = resolve_shape_with_reference(item.shape, reference_shape)
+            self._decode_cache_specs.append((shape, ort_dtype_from_str(item.type)))
 
     def ensure_bundled_assets(self) -> None:
         tokenizer_ready = (self.onnx_dir / "tokenizer_config.json").exists() or (self.onnx_dir / "tokenizer.json").exists()
@@ -580,7 +655,6 @@ class BatchedDecodeScheduler:
         self.decode_binding = self.runtime.decode_session.io_binding()
         self.decode_input_items = self.runtime.decode_input_items
         self.decode_output_items = self.runtime.decode_output_items
-        self.current_bank = 0
         self.active_slots: List[DecodeSlot] = []
 
         self.token_input = np.zeros((self.batch_size, 1), dtype=np.int64)
@@ -599,17 +673,23 @@ class BatchedDecodeScheduler:
             )
             for shape, dtype in self.runtime._decode_cache_specs
         ]
-        self.cache_banks: List[List[ort.OrtValue]] = [
-            [
-                ort.OrtValue.ortvalue_from_shape_and_type(shape, dtype, device_type="cuda", device_id=0)
-                for shape, dtype in self.cache_specs
-            ]
-            for _ in range(2)
+        self.cache_values = [
+            ort.OrtValue.ortvalue_from_shape_and_type(
+                ort_shape_to_alloc_list(shape, fallback_batch=self.batch_size, forced_batch=self.batch_size),
+                dtype,
+                device_type="cuda",
+                device_id=0,
+            )
+            for shape, dtype in self.runtime._prefill_cache_specs
         ]
-        self.cache_banks_gpu = [
-            [ortvalue_to_cupy(value, dtype) for value, (_, dtype) in zip(bank, self.cache_specs)]
-            for bank in self.cache_banks
+        self.cache_gpu = [
+            ortvalue_to_cupy(value, dtype) for value, (_, dtype) in zip(self.cache_values, self.runtime._prefill_cache_specs)
         ]
+        self.update_outputs = [
+            ort.OrtValue.ortvalue_from_shape_and_type(shape, dtype, device_type="cuda", device_id=0)
+            for shape, dtype in self.cache_specs
+        ]
+        self.update_gpu = [ortvalue_to_cupy(value, dtype) for value, (_, dtype) in zip(self.update_outputs, self.cache_specs)]
         self._thread.start()
 
     def submit(self, prepared: PreparedDecodeRequest) -> None:
@@ -619,11 +699,9 @@ class BatchedDecodeScheduler:
         return self._queue.qsize() + len(self.active_slots)
 
     def _copy_prefill_cache_to_slot(self, slot_index: int, cache_values: List[ort.OrtValue]) -> None:
-        dst_bank = self.cache_banks_gpu[self.current_bank]
-        for dst, src_value, (_, dtype) in zip(dst_bank, cache_values, self.cache_specs):
+        for dst, src_value, (_, dtype) in zip(self.cache_gpu, cache_values, self.runtime._prefill_cache_specs):
             src = ortvalue_to_cupy(src_value, dtype)
             cp.copyto(dst[slot_index : slot_index + 1], src)
-        cp.cuda.get_current_stream().synchronize()
 
     def _finalize_slot(self, slot: DecodeSlot, success: bool, error: Exception | None = None) -> None:
         if success:
@@ -710,18 +788,17 @@ class BatchedDecodeScheduler:
         self.decode_binding.clear_binding_outputs()
         self.decode_binding.bind_cpu_input(self.decode_input_items[0].name, self.token_input)
         self.decode_binding.bind_cpu_input(self.decode_input_items[1].name, self.cache_position)
-        for item, value in zip(self.decode_input_items[2:], self.cache_banks[self.current_bank]):
+        for item, value in zip(self.decode_input_items[2:], self.cache_values):
             bind_ortvalue_input(self.decode_binding, item.name, value)
 
         self.decode_binding.bind_ortvalue_output(self.decode_output_items[0].name, self.logits_output)
-        next_bank = 1 - self.current_bank
-        for item, value in zip(self.decode_output_items[1:], self.cache_banks[next_bank]):
+        for item, value in zip(self.decode_output_items[1:], self.update_outputs):
             self.decode_binding.bind_ortvalue_output(item.name, value)
 
         self.runtime.decode_session.run_with_iobinding(self.decode_binding)
         self.decode_binding.synchronize_outputs()
+        apply_cache_updates(self.cache_gpu, self.update_gpu, self.cache_position[:, 0], active_count)
         next_token_ids = cp.asnumpy(cp.argmax(self.logits_gpu[:active_count], axis=1)).astype(np.int64)
-        self.current_bank = next_bank
         survivors: List[tuple[int, DecodeSlot]] = []
         for slot_index, slot in enumerate(self.active_slots):
             predicted_token_id = int(next_token_ids[slot_index])
@@ -743,11 +820,9 @@ class BatchedDecodeScheduler:
         moved = False
         for new_index, (old_index, slot) in enumerate(survivors):
             if new_index != old_index:
-                for dst in self.cache_banks_gpu[self.current_bank]:
+                for dst in self.cache_gpu:
                     cp.copyto(dst[new_index : new_index + 1], dst[old_index : old_index + 1])
                 moved = True
-        if moved:
-            cp.cuda.get_current_stream().synchronize()
         self.active_slots = [slot for _, slot in survivors]
 
     def _run(self) -> None:
@@ -800,6 +875,9 @@ class OnnxAsrService:
             and all("CUDAExecutionProvider" in runtime.decode_session.get_providers() for runtime in self.runtimes)
             and self.runtime.metadata.get("decode_batch_mode") == "dynamic"
         )
+        self.prepare_workers = self.workers
+        if self._batched_decode_enabled:
+            self.prepare_workers = min(self.workers, max(1, self.replicas * 2), 4)
         self._sequence = itertools.count()
         self._request_ids = itertools.count(1)
         self._queue: queue.PriorityQueue[tuple[int, int, ServiceRequest | None]] = queue.PriorityQueue(self.max_queue_size)
@@ -822,7 +900,7 @@ class OnnxAsrService:
                 )
                 for runtime in self.runtimes
             ]
-        for worker_idx in range(self.workers):
+        for worker_idx in range(self.prepare_workers):
             thread = threading.Thread(
                 target=self._worker_loop,
                 name=f"onnx-asr-worker-{worker_idx:02d}",
@@ -982,6 +1060,7 @@ class OnnxAsrService:
             return {
                 "replicas": self.replicas,
                 "workers": self.workers,
+                "prepare_workers": self.prepare_workers,
                 "max_inflight": self.max_inflight,
                 "max_queue_size": self.max_queue_size,
                 "short_audio_seconds": self.short_audio_seconds,

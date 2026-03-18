@@ -126,6 +126,48 @@ class FixedSizeCache:
         return self.layers[layer_idx].update(key_states, value_states, cache_kwargs)
 
 
+class DeltaCacheLayer:
+    def __init__(self):
+        self.keys: torch.Tensor | None = None
+        self.values: torch.Tensor | None = None
+        self.last_key_update: torch.Tensor | None = None
+        self.last_value_update: torch.Tensor | None = None
+
+    def load(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        self.keys = key_states
+        self.values = value_states
+        self.last_key_update = None
+        self.last_value_update = None
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, cache_kwargs: dict[str, torch.Tensor] | None):
+        if self.keys is None or self.values is None:
+            raise RuntimeError("Delta cache layer must be loaded before decode.")
+        self.last_key_update = key_states
+        self.last_value_update = value_states
+        cache_position = cache_kwargs["cache_position"] if cache_kwargs is not None else None
+        if cache_position is None:
+            raise ValueError("Delta cache update requires cache_position.")
+        visible_len = torch.max(cache_position) + 1
+        scatter_index = cache_position.view(key_states.shape[0], 1, key_states.shape[2], 1).expand_as(key_states)
+        visible_keys = self.keys[:, :, :visible_len, :].scatter(2, scatter_index, key_states)
+        visible_values = self.values[:, :, :visible_len, :].scatter(2, scatter_index, value_states)
+        return visible_keys, visible_values
+
+
+class DeltaOnlyCache:
+    def __init__(self, num_layers: int):
+        self.layers = [DeltaCacheLayer() for _ in range(num_layers)]
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: dict[str, torch.Tensor] | None = None,
+    ):
+        return self.layers[layer_idx].update(key_states, value_states, cache_kwargs)
+
+
 def flatten_static_cache(cache: FixedSizeCache) -> List[torch.Tensor]:
     flat: List[torch.Tensor] = []
     for layer in cache.layers:
@@ -134,12 +176,27 @@ def flatten_static_cache(cache: FixedSizeCache) -> List[torch.Tensor]:
     return flat
 
 
-def flatten_cache_updates(cache: FixedSizeCache) -> List[torch.Tensor]:
+def flatten_cache_updates(cache: FixedSizeCache, cache_position: torch.Tensor) -> List[torch.Tensor]:
+    flat: List[torch.Tensor] = []
+    for layer in cache.layers:
+        if layer.keys is None or layer.values is None:
+            raise RuntimeError("Cache tensors are unavailable.")
+        gather_index = cache_position.view(cache_position.shape[0], 1, 1, 1).expand(
+            layer.keys.shape[0],
+            layer.keys.shape[1],
+            1,
+            layer.keys.shape[3],
+        )
+        flat.append(torch.gather(layer.keys, 2, gather_index).clone())
+        flat.append(torch.gather(layer.values, 2, gather_index).clone())
+    return flat
+
+
+def flatten_delta_updates(cache: DeltaOnlyCache) -> List[torch.Tensor]:
     flat: List[torch.Tensor] = []
     for layer in cache.layers:
         if layer.last_key_update is None or layer.last_value_update is None:
-            raise RuntimeError("Cache update tensors are unavailable.")
-        # Clone to force ONNX graph outputs to bind to the per-step KV tensors instead of the in-place updated full cache.
+            raise RuntimeError("Delta cache layer has no updates.")
         flat.append(layer.last_key_update.clone())
         flat.append(layer.last_value_update.clone())
     return flat
@@ -337,8 +394,8 @@ class DecodeCore(nn.Module):
         self.num_layers = num_layers
         self.max_cache_len = max_cache_len
 
-    def build_static_cache(self, past_key_values: Sequence[torch.Tensor]) -> FixedSizeCache:
-        cache = FixedSizeCache(num_layers=self.num_layers, max_cache_len=self.max_cache_len)
+    def build_delta_cache(self, past_key_values: Sequence[torch.Tensor]) -> DeltaOnlyCache:
+        cache = DeltaOnlyCache(num_layers=self.num_layers)
         for layer_idx, layer in enumerate(cache.layers):
             key_states = past_key_values[layer_idx * 2]
             value_states = past_key_values[layer_idx * 2 + 1]
@@ -351,7 +408,7 @@ class DecodeCore(nn.Module):
         cache_position: torch.Tensor,
         *past_key_values: torch.Tensor,
     ):
-        cache = self.build_static_cache(past_key_values)
+        cache = self.build_delta_cache(past_key_values)
         inputs_embeds = self.thinker.get_input_embeddings()(input_ids)
         position_ids = cache_position.unsqueeze(0).expand(3, -1, -1)
         text_position_ids = position_ids[0]
@@ -383,7 +440,7 @@ class DecodeCore(nn.Module):
         hidden_states = self.text_model.norm(hidden_states)
         last_hidden_state = hidden_states[:, -1:, :]
         logits = self.thinker.lm_head(last_hidden_state)
-        return (logits[:, 0, :], *flatten_cache_updates(cache))
+        return (logits[:, 0, :], *flatten_delta_updates(cache))
 
 
 def ensure_overwrite_allowed(paths: Sequence[Path], overwrite: bool) -> None:
@@ -595,6 +652,7 @@ def main() -> None:
         "decode_model": "decode.onnx",
         "shared_decoder_session": False,
         "decode_batch_mode": "dynamic",
+        "decode_cache_mode": "delta",
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as handle:
