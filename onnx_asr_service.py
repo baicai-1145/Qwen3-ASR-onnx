@@ -119,6 +119,10 @@ def get_cache_update_kernel(dtype: Any):
     return None
 
 
+def should_use_cache_update_kernel(active_count: int) -> bool:
+    return active_count == 1 or active_count >= _SCATTER_UPDATE_KERNEL_MIN_ACTIVE
+
+
 def is_url(text: str) -> bool:
     parsed = urlparse(text)
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
@@ -300,11 +304,14 @@ def apply_cache_updates(cache_arrays: Sequence[Any], update_arrays: Sequence[Any
         raise RuntimeError("CuPy is required for device-side cache updates.")
     if active_count <= 0:
         return
-    position_index = cp.asarray(np.asarray(positions[:active_count], dtype=np.int64))
+    if isinstance(positions, np.ndarray):
+        position_index = cp.asarray(np.asarray(positions[:active_count], dtype=np.int64))
+    else:
+        position_index = positions[:active_count]
     row_index = None
     for cache_array, update_array in zip(cache_arrays, update_arrays):
         kernel = get_cache_update_kernel(cache_array.dtype)
-        if kernel is None or active_count < _SCATTER_UPDATE_KERNEL_MIN_ACTIVE:
+        if kernel is None or not should_use_cache_update_kernel(active_count):
             if row_index is None:
                 row_index = cp.arange(active_count, dtype=cp.int64)
             cache_array[row_index, :, position_index, :] = update_array[:active_count, :, 0, :]
@@ -363,6 +370,11 @@ class DecoderThreadState:
     update_outputs: List[ort.OrtValue]
     token_input: np.ndarray
     cache_position: np.ndarray
+    token_input_value: ort.OrtValue | None = None
+    cache_position_value: ort.OrtValue | None = None
+    token_input_gpu: Any | None = None
+    cache_position_gpu: Any | None = None
+    decode_binding_initialized: bool = False
     logits_gpu: Any | None = None
     cache_gpu: List[Any] = field(default_factory=list)
     update_gpu: List[Any] = field(default_factory=list)
@@ -450,6 +462,39 @@ class OnnxAsrRuntime:
                 shape = resolve_shape_with_reference(item.shape, reference_shape)
             self._decode_cache_specs.append((shape, ort_dtype_from_str(item.type)))
 
+    def _initialize_decode_binding(self, state: DecoderThreadState) -> None:
+        if state.decode_binding_initialized:
+            return
+        decode_binding = state.decode_binding
+        decode_binding.clear_binding_inputs()
+        decode_binding.clear_binding_outputs()
+        if self._cuda_decode_enabled:
+            if state.token_input_value is None or state.cache_position_value is None:
+                raise RuntimeError("Missing GPU decode input buffers.")
+            bind_ortvalue_input(decode_binding, self.decode_input_items[0].name, state.token_input_value)
+            if self.shared_decoder_session:
+                decode_binding.bind_cpu_input(self.decode_input_items[1].name, self._shared_decode_audio_features)
+                bind_ortvalue_input(decode_binding, self.decode_input_items[2].name, state.cache_position_value)
+                cache_inputs = self.decode_input_items[3:]
+            else:
+                bind_ortvalue_input(decode_binding, self.decode_input_items[1].name, state.cache_position_value)
+                cache_inputs = self.decode_input_items[2:]
+        else:
+            decode_binding.bind_cpu_input(self.decode_input_items[0].name, state.token_input)
+            if self.shared_decoder_session:
+                decode_binding.bind_cpu_input(self.decode_input_items[1].name, self._shared_decode_audio_features)
+                decode_binding.bind_cpu_input(self.decode_input_items[2].name, state.cache_position)
+                cache_inputs = self.decode_input_items[3:]
+            else:
+                decode_binding.bind_cpu_input(self.decode_input_items[1].name, state.cache_position)
+                cache_inputs = self.decode_input_items[2:]
+        for item, value in zip(cache_inputs, state.cache_values):
+            bind_ortvalue_input(decode_binding, item.name, value)
+        decode_binding.bind_ortvalue_output(self.decode_output_items[0].name, state.logits_output)
+        for item, value in zip(self.decode_output_items[1:], state.update_outputs):
+            decode_binding.bind_ortvalue_output(item.name, value)
+        state.decode_binding_initialized = True
+
     def ensure_bundled_assets(self) -> None:
         tokenizer_ready = (self.onnx_dir / "tokenizer_config.json").exists() or (self.onnx_dir / "tokenizer.json").exists()
         if not tokenizer_ready:
@@ -476,6 +521,8 @@ class OnnxAsrRuntime:
         state = getattr(self._thread_local, "decoder_state", None)
         if state is None:
             device_type = "cuda" if self._cuda_decode_enabled else "cpu"
+            token_input = np.zeros((1, 1), dtype=np.int64)
+            cache_position = np.zeros((1, 1), dtype=np.int64)
             cache_values = [
                 ort.OrtValue.ortvalue_from_shape_and_type(shape, dtype, device_type=device_type, device_id=0)
                 for shape, dtype in self._prefill_cache_specs
@@ -490,14 +537,27 @@ class OnnxAsrRuntime:
                 device_type=device_type,
                 device_id=0,
             )
+            token_input_value = None
+            cache_position_value = None
+            token_input_gpu = None
+            cache_position_gpu = None
+            if self._cuda_decode_enabled:
+                token_input_value = ort.OrtValue.ortvalue_from_shape_and_type([1, 1], np.int64, device_type="cuda", device_id=0)
+                cache_position_value = ort.OrtValue.ortvalue_from_shape_and_type([1, 1], np.int64, device_type="cuda", device_id=0)
+                token_input_gpu = ortvalue_to_cupy(token_input_value, np.int64)
+                cache_position_gpu = ortvalue_to_cupy(cache_position_value, np.int64)
             state = DecoderThreadState(
                 prefill_binding=self.prefill_session.io_binding(),
                 decode_binding=self.decode_session.io_binding(),
                 logits_output=logits_output,
                 cache_values=cache_values,
                 update_outputs=update_outputs,
-                token_input=np.zeros((1, 1), dtype=np.int64),
-                cache_position=np.zeros((1, 1), dtype=np.int64),
+                token_input=token_input,
+                cache_position=cache_position,
+                token_input_value=token_input_value,
+                cache_position_value=cache_position_value,
+                token_input_gpu=token_input_gpu,
+                cache_position_gpu=cache_position_gpu,
                 logits_gpu=ortvalue_to_cupy(logits_output, self._decode_logits_dtype) if self._cuda_decode_enabled else None,
                 cache_gpu=(
                     [ortvalue_to_cupy(value, dtype) for value, (_, dtype) in zip(cache_values, self._prefill_cache_specs)]
@@ -514,6 +574,7 @@ class OnnxAsrRuntime:
                     for shape, dtype in self._prefill_cache_specs
                 ],
             )
+            self._initialize_decode_binding(state)
             self._thread_local.decoder_state = state
         return state
 
@@ -631,31 +692,22 @@ class OnnxAsrRuntime:
 
         generated_token_ids: List[int] = []
         state.cache_position[0, 0] = input_ids.shape[1]
+        if state.cache_position_gpu is not None:
+            state.cache_position_gpu[0, 0] = state.cache_position[0, 0]
         for _ in range(self.max_new_tokens):
             if next_token_id in self.eos_token_ids:
                 break
             generated_token_ids.append(next_token_id)
             decode_binding = state.decode_binding
-            decode_binding.clear_binding_inputs()
-            decode_binding.clear_binding_outputs()
             state.token_input[0, 0] = next_token_id
-            decode_binding.bind_cpu_input(self.decode_input_items[0].name, state.token_input)
-            if self.shared_decoder_session:
-                decode_binding.bind_cpu_input(self.decode_input_items[1].name, self._shared_decode_audio_features)
-                decode_binding.bind_cpu_input(self.decode_input_items[2].name, state.cache_position)
-                cache_inputs = self.decode_input_items[3:]
-            else:
-                decode_binding.bind_cpu_input(self.decode_input_items[1].name, state.cache_position)
-                cache_inputs = self.decode_input_items[2:]
-            for item, value in zip(cache_inputs, state.cache_values):
-                bind_ortvalue_input(decode_binding, item.name, value)
-            decode_binding.bind_ortvalue_output(self.decode_output_items[0].name, state.logits_output)
-            for item, value in zip(self.decode_output_items[1:], state.update_outputs):
-                decode_binding.bind_ortvalue_output(item.name, value)
+            if state.token_input_gpu is not None and state.cache_position_gpu is not None:
+                state.token_input_gpu[0, 0] = next_token_id
+                state.cache_position_gpu[0, 0] = state.cache_position[0, 0]
             self.decode_session.run_with_iobinding(decode_binding)
             if state.logits_gpu is not None:
                 decode_binding.synchronize_outputs()
-                apply_cache_updates(state.cache_gpu, state.update_gpu, state.cache_position[:, 0], active_count=1)
+                positions = state.cache_position_gpu[:, 0] if state.cache_position_gpu is not None else state.cache_position[:, 0]
+                apply_cache_updates(state.cache_gpu, state.update_gpu, positions, active_count=1)
             else:
                 apply_cache_updates_cpu(state.cache_values, state.update_outputs, state.cache_position[:, 0], active_count=1)
             next_token_id = int(argmax_token_ids(state.logits_output, state.logits_gpu, active_count=1)[0])
@@ -725,6 +777,10 @@ class BatchedDecodeScheduler:
 
         self.token_input = np.zeros((self.batch_size, 1), dtype=np.int64)
         self.cache_position = np.zeros((self.batch_size, 1), dtype=np.int64)
+        self.token_input_value = ort.OrtValue.ortvalue_from_shape_and_type([self.batch_size, 1], np.int64, device_type="cuda", device_id=0)
+        self.cache_position_value = ort.OrtValue.ortvalue_from_shape_and_type([self.batch_size, 1], np.int64, device_type="cuda", device_id=0)
+        self.token_input_gpu = ortvalue_to_cupy(self.token_input_value, np.int64)
+        self.cache_position_gpu = ortvalue_to_cupy(self.cache_position_value, np.int64)
         self.logits_output = ort.OrtValue.ortvalue_from_shape_and_type(
             ort_shape_to_alloc_list(self.decode_output_items[0].shape, fallback_batch=self.batch_size, forced_batch=self.batch_size),
             ort_dtype_from_str(self.decode_output_items[0].type),
@@ -756,6 +812,15 @@ class BatchedDecodeScheduler:
             for shape, dtype in self.cache_specs
         ]
         self.update_gpu = [ortvalue_to_cupy(value, dtype) for value, (_, dtype) in zip(self.update_outputs, self.cache_specs)]
+        self.decode_binding.clear_binding_inputs()
+        self.decode_binding.clear_binding_outputs()
+        bind_ortvalue_input(self.decode_binding, self.decode_input_items[0].name, self.token_input_value)
+        bind_ortvalue_input(self.decode_binding, self.decode_input_items[1].name, self.cache_position_value)
+        for item, value in zip(self.decode_input_items[2:], self.cache_values):
+            bind_ortvalue_input(self.decode_binding, item.name, value)
+        self.decode_binding.bind_ortvalue_output(self.decode_output_items[0].name, self.logits_output)
+        for item, value in zip(self.decode_output_items[1:], self.update_outputs):
+            self.decode_binding.bind_ortvalue_output(item.name, value)
         self._thread.start()
 
     def submit(self, prepared: PreparedDecodeRequest) -> None:
@@ -850,20 +915,12 @@ class BatchedDecodeScheduler:
             self.token_input[slot_index, 0] = slot.current_token_id
             self.cache_position[slot_index, 0] = slot.cache_position
 
-        self.decode_binding.clear_binding_inputs()
-        self.decode_binding.clear_binding_outputs()
-        self.decode_binding.bind_cpu_input(self.decode_input_items[0].name, self.token_input)
-        self.decode_binding.bind_cpu_input(self.decode_input_items[1].name, self.cache_position)
-        for item, value in zip(self.decode_input_items[2:], self.cache_values):
-            bind_ortvalue_input(self.decode_binding, item.name, value)
-
-        self.decode_binding.bind_ortvalue_output(self.decode_output_items[0].name, self.logits_output)
-        for item, value in zip(self.decode_output_items[1:], self.update_outputs):
-            self.decode_binding.bind_ortvalue_output(item.name, value)
+        cp.copyto(self.token_input_gpu[:active_count, 0], cp.asarray(self.token_input[:active_count, 0]))
+        cp.copyto(self.cache_position_gpu[:active_count, 0], cp.asarray(self.cache_position[:active_count, 0]))
 
         self.runtime.decode_session.run_with_iobinding(self.decode_binding)
         self.decode_binding.synchronize_outputs()
-        apply_cache_updates(self.cache_gpu, self.update_gpu, self.cache_position[:, 0], active_count)
+        apply_cache_updates(self.cache_gpu, self.update_gpu, self.cache_position_gpu[:, 0], active_count)
         next_token_ids = cp.asnumpy(cp.argmax(self.logits_gpu[:active_count], axis=1)).astype(np.int64)
         survivors: List[tuple[int, DecodeSlot]] = []
         for slot_index, slot in enumerate(self.active_slots):
