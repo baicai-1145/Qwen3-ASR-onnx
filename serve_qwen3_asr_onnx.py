@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0", help="HTTP listen host.")
     parser.add_argument("--port", type=int, default=18080, help="HTTP listen port.")
     parser.add_argument("--workers", type=int, default=4, help="Number of service worker threads.")
+    parser.add_argument("--replicas", type=int, default=1, help="Number of ONNX runtime replicas.")
     parser.add_argument("--max-inflight", type=int, default=4, help="Maximum in-flight inference requests.")
     parser.add_argument("--max-queue-size", type=int, default=64, help="Maximum queued requests.")
     parser.add_argument("--short-audio-seconds", type=float, default=20.0, help="Short-audio priority threshold.")
@@ -113,6 +114,7 @@ def main() -> None:
         providers=args.providers,
         max_new_tokens=args.max_new_tokens,
         workers=args.workers,
+        replicas=args.replicas,
         max_inflight=args.max_inflight,
         max_queue_size=args.max_queue_size,
         short_audio_seconds=args.short_audio_seconds,
