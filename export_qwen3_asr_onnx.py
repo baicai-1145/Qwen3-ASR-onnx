@@ -76,6 +76,8 @@ class FixedSizeCacheLayer:
         self.max_cache_len = max_cache_len
         self.keys: torch.Tensor | None = None
         self.values: torch.Tensor | None = None
+        self.last_key_update: torch.Tensor | None = None
+        self.last_value_update: torch.Tensor | None = None
 
     def allocate_like(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         self.keys = torch.zeros(
@@ -92,20 +94,21 @@ class FixedSizeCacheLayer:
     def load(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         self.keys = key_states
         self.values = value_states
+        self.last_key_update = None
+        self.last_value_update = None
 
     def update(self, key_states: torch.Tensor, value_states: torch.Tensor, cache_kwargs: dict[str, torch.Tensor] | None):
         if self.keys is None or self.values is None:
             self.allocate_like(key_states, value_states)
+        self.last_key_update = key_states
+        self.last_value_update = value_states
         cache_position = cache_kwargs["cache_position"] if cache_kwargs is not None else None
         if cache_position is None:
-            cache_position = torch.arange(key_states.shape[-2], device=key_states.device)
-        try:
-            self.keys.index_copy_(2, cache_position, key_states)
-            self.values.index_copy_(2, cache_position, value_states)
-        except NotImplementedError:
-            self.keys[:, :, cache_position] = key_states
-            self.values[:, :, cache_position] = value_states
-        visible_len = cache_position[-1] + 1
+            cache_position = torch.arange(key_states.shape[-2], device=key_states.device).view(1, -1)
+        scatter_index = cache_position.view(key_states.shape[0], 1, key_states.shape[2], 1).expand_as(key_states)
+        self.keys.scatter_(2, scatter_index, key_states)
+        self.values.scatter_(2, scatter_index, value_states)
+        visible_len = torch.max(cache_position) + 1
         return self.keys[:, :, :visible_len, :], self.values[:, :, :visible_len, :]
 
 
@@ -128,6 +131,17 @@ def flatten_static_cache(cache: FixedSizeCache) -> List[torch.Tensor]:
     for layer in cache.layers:
         flat.append(layer.keys)
         flat.append(layer.values)
+    return flat
+
+
+def flatten_cache_updates(cache: FixedSizeCache) -> List[torch.Tensor]:
+    flat: List[torch.Tensor] = []
+    for layer in cache.layers:
+        if layer.last_key_update is None or layer.last_value_update is None:
+            raise RuntimeError("Cache update tensors are unavailable.")
+        # Clone to force ONNX graph outputs to bind to the per-step KV tensors instead of the in-place updated full cache.
+        flat.append(layer.last_key_update.clone())
+        flat.append(layer.last_value_update.clone())
     return flat
 
 
@@ -282,20 +296,20 @@ class DecoderCore(nn.Module):
     ):
         cache = self.build_static_cache(past_key_values)
         inputs_embeds = self.build_inputs_embeds(input_ids, audio_features)
-        position_ids = cache_position.view(1, 1, -1).expand(3, input_ids.shape[0], -1)
+        position_ids = cache_position.unsqueeze(0).expand(3, -1, -1)
         text_position_ids = position_ids[0]
-        visible_len = cache_position[-1] + 1
+        visible_len = torch.max(cache_position) + 1
 
         key_positions = torch.arange(visible_len, device=input_ids.device)
-        query_positions = cache_position.view(-1, 1)
-        blocked = key_positions.view(1, visible_len) > query_positions
+        query_positions = cache_position
+        blocked = key_positions.view(1, 1, visible_len) > query_positions.unsqueeze(-1)
         causal_mask = torch.zeros(
             (input_ids.shape[0], 1, input_ids.shape[1], visible_len),
             dtype=inputs_embeds.dtype,
             device=input_ids.device,
         )
         min_value = torch.finfo(inputs_embeds.dtype).min
-        causal_mask = causal_mask.masked_fill(blocked.unsqueeze(0).unsqueeze(0), min_value)
+        causal_mask = causal_mask.masked_fill(blocked.unsqueeze(1), min_value)
 
         hidden_states = inputs_embeds
         position_embeddings = self.text_model.rotary_emb(hidden_states, position_ids)
@@ -315,6 +329,63 @@ class DecoderCore(nn.Module):
         return (logits[:, 0, :], *flatten_static_cache(cache))
 
 
+class DecodeCore(nn.Module):
+    def __init__(self, thinker: nn.Module, num_layers: int, max_cache_len: int):
+        super().__init__()
+        self.thinker = thinker
+        self.text_model = thinker.model
+        self.num_layers = num_layers
+        self.max_cache_len = max_cache_len
+
+    def build_static_cache(self, past_key_values: Sequence[torch.Tensor]) -> FixedSizeCache:
+        cache = FixedSizeCache(num_layers=self.num_layers, max_cache_len=self.max_cache_len)
+        for layer_idx, layer in enumerate(cache.layers):
+            key_states = past_key_values[layer_idx * 2]
+            value_states = past_key_values[layer_idx * 2 + 1]
+            layer.load(key_states, value_states)
+        return cache
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        cache_position: torch.Tensor,
+        *past_key_values: torch.Tensor,
+    ):
+        cache = self.build_static_cache(past_key_values)
+        inputs_embeds = self.thinker.get_input_embeddings()(input_ids)
+        position_ids = cache_position.unsqueeze(0).expand(3, -1, -1)
+        text_position_ids = position_ids[0]
+        visible_len = torch.max(cache_position) + 1
+
+        key_positions = torch.arange(visible_len, device=input_ids.device)
+        query_positions = cache_position
+        blocked = key_positions.view(1, 1, visible_len) > query_positions.unsqueeze(-1)
+        causal_mask = torch.zeros(
+            (input_ids.shape[0], 1, input_ids.shape[1], visible_len),
+            dtype=inputs_embeds.dtype,
+            device=input_ids.device,
+        )
+        min_value = torch.finfo(inputs_embeds.dtype).min
+        causal_mask = causal_mask.masked_fill(blocked.unsqueeze(1), min_value)
+
+        hidden_states = inputs_embeds
+        position_embeddings = self.text_model.rotary_emb(hidden_states, position_ids)
+        for layer in self.text_model.layers:
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=text_position_ids,
+                past_key_values=cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+
+        hidden_states = self.text_model.norm(hidden_states)
+        last_hidden_state = hidden_states[:, -1:, :]
+        logits = self.thinker.lm_head(last_hidden_state)
+        return (logits[:, 0, :], *flatten_cache_updates(cache))
+
+
 def ensure_overwrite_allowed(paths: Sequence[Path], overwrite: bool) -> None:
     existing = [path for path in paths if path.exists()]
     if existing and not overwrite:
@@ -327,12 +398,12 @@ def append_worklog(worklog_path: Path, model_name: str, output_dir: Path, dtype_
         "",
         f"### 节点 6：ONNX 导出完成（{model_name}）",
         f"- 完成时间：`{time.strftime('%Y-%m-%d %H:%M:%S')}`",
-        "- 导出范围：单音频全链路纯 ONNX 运行时所需的 2 张图：`encoder`、`decoder`。",
+        "- 导出范围：单音频全链路纯 ONNX 运行时所需的 3 张图：`encoder`、`prefill`、`decode`。",
         "- 运行时依赖目标：`onnxruntime + transformers(tokenizer/feature_extractor) + numpy + soundfile/librosa`，不依赖 PyTorch。",
         "- 说明：音频编码链路已合并为单一 `encoder.onnx`，内部仍使用同权重的 ONNX 友好实现。",
         f"- 导出 dtype：`{dtype_name}`",
         f"- 导出目录：`{output_dir}`",
-        "- decoder 图说明：prefill/decode 复用同一张 decoder 图与同一套权重，保留固定 shape 静态 KV cache。",
+        "- decoder 图说明：导出为 `prefill + decode` 双图，`decode` 仅保留逐 token 必需输入，以降低多并发逐 token 开销。",
     ]
     with worklog_path.open("a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
@@ -344,6 +415,8 @@ def cleanup_legacy_exports(output_dir: Path) -> None:
         "conv_embed.onnx.data",
         "audio_stack.onnx",
         "audio_stack.onnx.data",
+        "decoder.onnx",
+        "decoder.onnx.data",
     ):
         path = output_dir / name
         if path.exists():
@@ -368,7 +441,8 @@ def main() -> None:
 
     paths = [
         output_dir / "encoder.onnx",
-        output_dir / "decoder.onnx",
+        output_dir / "prefill.onnx",
+        output_dir / "decode.onnx",
         output_dir / "metadata.json",
     ]
     ensure_overwrite_allowed(paths, overwrite=args.overwrite)
@@ -442,7 +516,7 @@ def main() -> None:
         )
         for _ in range(num_layers * 2)
     )
-    cache_position = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long)
+    cache_position = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long).view(1, -1)
     decoder_core = DecoderCore(
         thinker,
         audio_token_id=thinker.config.audio_token_id,
@@ -452,14 +526,46 @@ def main() -> None:
     export_graph(
         decoder_core,
         args_tuple=(input_ids, audio_features, cache_position, *empty_cache),
-        output_path=output_dir / "decoder.onnx",
+        output_path=output_dir / "prefill.onnx",
         input_names=["input_ids", "audio_features", "cache_position", *past_names],
         output_names=["logits", *present_names],
         dynamic_axes={
             "input_ids": {1: "query_seq"},
             "audio_features": {0: "audio_seq"},
-            "cache_position": {0: "query_seq"},
+            "cache_position": {1: "query_seq"},
             "logits": {0: "batch"},
+        },
+        opset=args.opset,
+    )
+
+    decode_batch = 2
+    decode_input_ids = input_ids[:, :1].repeat(decode_batch, 1).contiguous()
+    decode_cache_position = torch.full((decode_batch, 1), input_ids.shape[1], device=input_ids.device, dtype=torch.long)
+    decode_empty_cache = tuple(
+        torch.zeros(
+            (decode_batch, num_key_value_heads, args.static_cache_len, head_dim),
+            device=input_ids.device,
+            dtype=export_dtype,
+        )
+        for _ in range(num_layers * 2)
+    )
+    decode_core = DecodeCore(
+        thinker,
+        num_layers=num_layers,
+        max_cache_len=args.static_cache_len,
+    ).eval()
+    export_graph(
+        decode_core,
+        args_tuple=(decode_input_ids, decode_cache_position, *decode_empty_cache),
+        output_path=output_dir / "decode.onnx",
+        input_names=["input_ids", "cache_position", *past_names],
+        output_names=["logits", *present_names],
+        dynamic_axes={
+            "input_ids": {0: "batch"},
+            "cache_position": {0: "batch"},
+            "logits": {0: "batch"},
+            **{name: {0: "batch"} for name in past_names},
+            **{name: {0: "batch"} for name in present_names},
         },
         opset=args.opset,
     )
@@ -484,10 +590,11 @@ def main() -> None:
         "num_layers": num_layers,
         "static_cache_len": int(args.static_cache_len),
         "encoder_model": "encoder.onnx",
-        "decoder_model": "decoder.onnx",
-        "prefill_model": "decoder.onnx",
-        "decode_model": "decoder.onnx",
-        "shared_decoder_session": True,
+        "decoder_model": "prefill.onnx",
+        "prefill_model": "prefill.onnx",
+        "decode_model": "decode.onnx",
+        "shared_decoder_session": False,
+        "decode_batch_mode": "dynamic",
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as handle:
