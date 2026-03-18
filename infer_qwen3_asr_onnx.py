@@ -12,7 +12,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run single-audio Qwen3-ASR inference with ONNX Runtime only, without PyTorch."
     )
-    parser.add_argument("--model", required=True, help="Local model directory for tokenizer and feature extractor.")
     parser.add_argument("--onnx-dir", required=True, help="Directory containing exported ONNX files and metadata.json.")
     parser.add_argument("--audio", required=True, help="Audio path, URL or base64 data URL.")
     parser.add_argument("--context", default="", help="Optional system context.")
@@ -31,7 +30,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     runtime = OnnxAsrRuntime(
-        model_dir=Path(args.model).resolve(),
         onnx_dir=Path(args.onnx_dir).resolve(),
         providers=args.providers,
         max_new_tokens=args.max_new_tokens,

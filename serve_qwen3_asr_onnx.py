@@ -13,7 +13,6 @@ from onnx_asr_service import OnnxAsrService, QueueFullError
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve Qwen3-ASR ONNX as a local HTTP service.")
-    parser.add_argument("--model", required=True, help="Local model directory for tokenizer and feature extractor.")
     parser.add_argument("--onnx-dir", required=True, help="Directory containing exported ONNX files and metadata.json.")
     parser.add_argument("--host", default="0.0.0.0", help="HTTP listen host.")
     parser.add_argument("--port", type=int, default=18080, help="HTTP listen port.")
@@ -110,7 +109,6 @@ class AsrRequestHandler(BaseHTTPRequestHandler):
 def main() -> None:
     args = parse_args()
     service = OnnxAsrService(
-        model_dir=Path(args.model).resolve(),
         onnx_dir=Path(args.onnx_dir).resolve(),
         providers=args.providers,
         max_new_tokens=args.max_new_tokens,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import List, Sequence
@@ -349,6 +350,16 @@ def cleanup_legacy_exports(output_dir: Path) -> None:
             path.unlink()
 
 
+def bundle_runtime_assets(model_path: Path, output_dir: Path, processor: AutoProcessor) -> None:
+    processor.save_pretrained(str(output_dir))
+    chat_template_path = model_path / "chat_template.json"
+    if chat_template_path.exists():
+        shutil.copy2(chat_template_path, output_dir / "chat_template.json")
+    generation_config_path = model_path / "generation_config.json"
+    if generation_config_path.exists():
+        shutil.copy2(generation_config_path, output_dir / "generation_config.json")
+
+
 def main() -> None:
     args = parse_args()
     model_path = Path(args.model).resolve()
@@ -481,6 +492,7 @@ def main() -> None:
     }
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, ensure_ascii=False, indent=2)
+    bundle_runtime_assets(model_path=model_path, output_dir=output_dir, processor=processor)
     cleanup_legacy_exports(output_dir)
 
     if args.worklog:

@@ -71,19 +71,32 @@ pip install -e ".[export]"
 pip install -e ".[dev-full]"
 ```
 
-### 2. 下载模型
+### 2. 下载 ONNX 模型
 
-推荐通过 ModelScope 下载本地模型：
+可以直接从 Hugging Face 或 ModelScope 下载已经导出的 ONNX 包：
+
+Hugging Face:
+
+```bash
+pip install -U huggingface_hub
+huggingface-cli download baicai1145/Qwen3-ASR-0.6B-ONNX --local-dir ./onnx/Qwen3-ASR-0.6B
+huggingface-cli download baicai1145/Qwen3-ASR-1.7B-ONNX --local-dir ./onnx/Qwen3-ASR-1.7B
+```
+
+ModelScope:
 
 ```bash
 pip install -U modelscope
-modelscope download --model Qwen/Qwen3-ASR-0.6B --local_dir ./models/Qwen3-ASR-0.6B
-modelscope download --model Qwen/Qwen3-ASR-1.7B --local_dir ./models/Qwen3-ASR-1.7B
+modelscope download --model baicai1145/Qwen3-ASR-0.6B-ONNX --local_dir ./onnx/Qwen3-ASR-0.6B
+modelscope download --model baicai1145/Qwen3-ASR-1.7B-ONNX --local_dir ./onnx/Qwen3-ASR-1.7B
 ```
 
 ### 3. 导出 ONNX
 
+如果你直接下载上面的 ONNX 包，可以跳过这一步。
+
 注意：导出阶段仍然需要 PyTorch；纯 ONNX 仅针对运行时。
+导出完成后，`onnx` 目录会同时打包 tokenizer、feature extractor 和 chat template，部署时默认不再需要原始模型目录。
 
 ```bash
 python export_qwen3_asr_onnx.py \
@@ -98,7 +111,6 @@ python export_qwen3_asr_onnx.py \
 
 ```bash
 python infer_qwen3_asr_onnx.py \
-  --model models/Qwen3-ASR-0.6B \
   --onnx-dir onnx/Qwen3-ASR-0.6B \
   --audio samples/asr_zh.wav
 ```
@@ -107,7 +119,6 @@ python infer_qwen3_asr_onnx.py \
 
 ```bash
 python serve_qwen3_asr_onnx.py \
-  --model models/Qwen3-ASR-0.6B \
   --onnx-dir onnx/Qwen3-ASR-0.6B \
   --host 0.0.0.0 \
   --port 18080 \
