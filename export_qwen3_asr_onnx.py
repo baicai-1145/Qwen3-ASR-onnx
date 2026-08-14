@@ -573,7 +573,7 @@ def main() -> None:
         )
         for _ in range(num_layers * 2)
     )
-    cache_position = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long).view(1, -1)
+    cache_position = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long)
     decoder_core = DecoderCore(
         thinker,
         audio_token_id=thinker.config.audio_token_id,
@@ -589,7 +589,7 @@ def main() -> None:
         dynamic_axes={
             "input_ids": {1: "query_seq"},
             "audio_features": {0: "audio_seq"},
-            "cache_position": {1: "query_seq"},
+            "cache_position": {0: "query_seq"},
             "logits": {0: "batch"},
         },
         opset=args.opset,
@@ -597,7 +597,7 @@ def main() -> None:
 
     decode_batch = 2
     decode_input_ids = input_ids[:, :1].repeat(decode_batch, 1).contiguous()
-    decode_cache_position = torch.full((decode_batch, 1), input_ids.shape[1], device=input_ids.device, dtype=torch.long)
+    decode_cache_position = torch.full((decode_batch,), input_ids.shape[1], device=input_ids.device, dtype=torch.long)
     decode_empty_cache = tuple(
         torch.zeros(
             (decode_batch, num_key_value_heads, args.static_cache_len, head_dim),
